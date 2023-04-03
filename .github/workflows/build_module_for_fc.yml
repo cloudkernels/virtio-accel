@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, "${{ matrix.arch }}" ]
+    runs-on: [self-hosted, "${{ matrix.arch }}", gcc, lite ]
     strategy:
       matrix:
         arch: [x86_64, aarch64]
@@ -24,14 +24,12 @@ jobs:
             echo "ARTIFACT_SHA=$(echo ${{github.sha}})" >> $GITHUB_ENV
           fi
 
-      - name: Install building deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libz-dev bin86 bison flex bc libelf-dev libssl-dev wget zip gcc-8
 
         # This is hardcoded for now in the version of linux that Firecracker works with
       - name: Set kernel version
-        run: echo "RELEASE_VERSION=v5.10" >> $GITHUB_ENV
+        run: |
+          echo "RELEASE_VERSION=v5.10" >> $GITHUB_ENV
+          sudo apt update && sudo apt install -y build-essential libz-dev bin86 bison flex bc libelf-dev libssl-dev wget zip
 
       - name: Fetch virtio-accel
         uses: actions/checkout@v2
@@ -50,7 +48,7 @@ jobs:
         id: build-vmlinux
         working-directory: linux
         run: |
-          sudo ln -sf /usr/bin/gcc-8 /usr/bin/gcc
+          #sudo ln -sf /usr/bin/gcc-8 /usr/bin/gcc
           if [[ "${{ matrix.arch }}" == "aarch64" ]]
           then
             wget https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-arm64-5.10.config
@@ -61,25 +59,29 @@ jobs:
             touch .config
             make microvm.config
             make Image -j$(nproc) 
+            make Image.gz -j$(nproc) 
             make modules -j$(nproc) 
             sudo mv arch/arm64/boot/Image vmlinux
+            sudo cp arch/arm64/boot/Image.gz vmlinuz
           else
             wget https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-x86_64-5.10.config -O arch/x86/configs/microvm.config
             echo '::set-output name=artifact_pathing::vmlinux'
             touch .config
             make microvm.config CONFIG_MODULES=y
-            CC=gcc-8 make -j$(nproc)
+            #CC=gcc-8 make -j$(nproc)
+            make -j$(nproc)
+            sudo cp arch/x86_64/boot/bzImage vmlinuz
           fi
-          sudo ln -sf /usr/bin/gcc-9 /usr/bin/gcc
+          #sudo ln -sf /usr/bin/gcc-9 /usr/bin/gcc
 
 
       - name: Build virtio-accel
         id: build-virtio
         working-directory: virtio-accel
         run: |
-          sudo ln -sf /usr/bin/gcc-8 /usr/bin/gcc
+          #sudo ln -sf /usr/bin/gcc-8 /usr/bin/gcc
           make KDIR=../linux ZC=0
-          sudo ln -sf /usr/bin/gcc-9 /usr/bin/gcc
+          #sudo ln -sf /usr/bin/gcc-9 /usr/bin/gcc
 
       - name: Upload linux Image
         id: upload-image
@@ -89,6 +91,16 @@ jobs:
           access-key: ${{ secrets.AWS_ACCESS_KEY }}
           secret-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           local-path: linux/vmlinux
+          remote-path: nbfc-assets/github/virtio-accel/${{ env.ARTIFACT_SHA }}/${{ matrix.arch }}/linux/
+
+      - name: Upload compressed linux Image
+        id: upload-zimage
+        uses: cloudkernels/minio-upload@master
+        with:
+          url: https://s3.nubificus.co.uk
+          access-key: ${{ secrets.AWS_ACCESS_KEY }}
+          secret-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          local-path: linux/vmlinuz
           remote-path: nbfc-assets/github/virtio-accel/${{ env.ARTIFACT_SHA }}/${{ matrix.arch }}/linux/
 
       - name: Upload virtio
