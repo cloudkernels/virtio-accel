@@ -9,6 +9,7 @@
 
 #include "accel.h"
 #include "virtio_accel-common.h"
+#include "virtio_accel-prof.h"
 
 
 static int virtaccel_get_user_buf(struct virtio_accel_arg *v, int write,
@@ -161,6 +162,10 @@ static int virtaccel_prepare_request(struct virtio_device *vdev, u32 op_type,
 
 	total_sgs += ret;
 
+	ret = virtaccel_copy_args(virtio->op.in, virtio->op.in_nr);
+	if (ret < 0)
+		goto free_in;
+
 	ret = virtaccel_prepare_args(&virtio->op.out, usr_sess->op.out,
 			virtio->op.out_nr, vdev);
 	if (ret < 0)
@@ -251,9 +256,11 @@ int virtaccel_req_create_session(struct virtio_accel_req *req)
 	int ret, out_nsgs = 0, in_nsgs = 0,
 		total_sgs = 3; // dyn sgs added later
 
+	//virtaccel_timer_start("accel > create session > prepare request", vaccel);
 	ret = virtaccel_prepare_request(vdev, VIRTIO_ACCEL_CREATE_SESSION, h, sess);
 	if (ret < 0)
 		return ret;
+	//virtaccel_timer_stop("accel > create session > prepare request", vaccel);
 
 	total_sgs += ret;
 
@@ -264,6 +271,8 @@ int virtaccel_req_create_session(struct virtio_accel_req *req)
 		goto free_request;
 	}
 
+	//virtaccel_timer_start("accel > create session > create sg lists", vaccel);
+	ret = virtaccel_prepare_request(vdev, VIRTIO_ACCEL_CREATE_SESSION, h, sess);
 	/* virtio header */
 	sg_add_vaccel_one(&sgs[out_nsgs++], &hdr_sg, h, sizeof(*h));
 
@@ -302,10 +311,13 @@ int virtaccel_req_create_session(struct virtio_accel_req *req)
 	req->sgs = sgs;
 	req->out_sgs = out_nsgs;
 	req->in_sgs = in_nsgs;
+	//virtaccel_timer_stop("accel > create session > create sg lists", vaccel);
 
+	//virtaccel_timer_start("accel > create session > do req", vaccel);
 	ret = virtaccel_do_req(req);
 	if (ret != -EINPROGRESS)
 		goto free_in_sg;
+	//virtaccel_timer_stop("accel > create session > do req", vaccel);
 
 	return ret;
 
@@ -360,10 +372,142 @@ int virtaccel_req_operation(struct virtio_accel_req *req)
 	int ret, out_nsgs = 0, in_nsgs = 0,
 		total_sgs = 2; // dyn sgs added later
 
+	struct virtio_accel_sess *vsess =
+		virtaccel_session_get_by_id(sess->id, req);
+
+	virtaccel_timer_start("accel > operation > prepare request", vsess);
 	ret = virtaccel_prepare_request(vdev, VIRTIO_ACCEL_DO_OP, h, sess);
 	if (ret < 0)
 		return ret;
+	virtaccel_timer_stop("accel > operation > prepare request", vsess);
 
+	virtaccel_timer_start("accel > operation > create sg lists", vsess);
+	total_sgs += ret;
+
+	sgs = kzalloc_node(total_sgs * sizeof(*sgs), GFP_ATOMIC,
+			dev_to_node(&vdev->dev));
+	if (!sgs) {
+		ret = -ENOMEM;
+		goto free_request;
+	}
+
+	/* virtio header */
+	sg_add_vaccel_one(&sgs[out_nsgs++], &hdr_sg, h, sizeof(*h));
+
+	/* virtio out arguments header */
+	if (h->op.out_nr)
+		sg_add_vaccel_one(&sgs[out_nsgs++], &hdrout_sg, h->op.out,
+				h->op.out_nr * sizeof(*h->op.out));
+
+	/* virtio in arguments header */
+	if (h->op.in_nr)
+		sg_add_vaccel_one(&sgs[out_nsgs++], &hdrin_sg, h->op.in,
+				h->op.in_nr * sizeof(*h->op.in));
+
+	/* user out arguments */
+	ret = sg_add_vaccel_args(&sgs[out_nsgs], h->op.out, h->op.out_nr, vdev);
+	if (ret < 0)
+		goto free_sgs;
+
+	out_nsgs += ret;
+
+	/* user in arguments */
+	ret = sg_add_vaccel_args(&sgs[out_nsgs], h->op.in, h->op.in_nr, vdev);
+	if (ret < 0)
+		goto free_out_sg;
+
+	in_nsgs += ret;
+
+	/* result status */
+	sg_add_vaccel_one(&sgs[out_nsgs + in_nsgs++], &status_sg, &req->status,
+			sizeof(req->status));
+
+	req->sgs = sgs;
+	req->out_sgs = out_nsgs;
+	req->in_sgs = in_nsgs;
+	virtaccel_timer_stop("accel > operation > create sg lists", vsess);
+
+	virtaccel_timer_start("accel > operation > do req", vsess);
+	ret = virtaccel_do_req(req);
+	if (ret != -EINPROGRESS)
+		goto free_in_sg;
+	virtaccel_timer_stop("accel > operation > do req", vsess);
+
+	return ret;
+
+free_in_sg:
+	if (sess->op.in_nr)
+		sg_cleanup(sgs[out_nsgs]);
+free_out_sg:
+	if (sess->op.out_nr) {
+		if (sess->op.in_nr)
+			sg_cleanup(sgs[3]);
+		else
+			sg_cleanup(sgs[2]);
+	}
+free_sgs:
+	kfree(sgs);
+free_request:
+	virtaccel_cleanup_args(h->op.out, h->op.out_nr);
+	virtaccel_cleanup_args(h->op.in, h->op.in_nr);
+
+	return ret;
+}
+
+static int virtaccel_write_user_output(struct virtio_accel_arg *varg, u32 nr_arg)
+{
+#ifndef ZC
+	int i = 0;
+
+	if (!nr_arg)
+		return 0;
+
+	for (i = 0; i < nr_arg; ++i) {
+		if (unlikely(copy_to_user(varg[i].usr_buf, varg[i].buf,
+					varg[i].len)))
+			return -EINVAL;
+	}
+#endif
+
+	return 0;
+}
+
+static void *virtaccel_get_prepared_buf(struct virtio_accel_arg *varg,
+		struct virtio_device *vdev)
+{
+#ifdef ZC
+	void *b = vmap((struct page **)varg->usr_pages,
+			virtio32_to_cpu(vdev, varg->usr_npages), VM_MAP, PAGE_KERNEL);
+	if (b)
+		return b + PAGEOFFSET((unsigned long)varg->usr_buf);
+	else
+		return b;
+#else
+	return varg->buf;
+#endif
+}
+
+static void virtaccel_put_prepared_buf(struct virtio_accel_arg *varg,
+		void *buf)
+{
+#ifdef ZC
+	vunmap(buf - PAGEOFFSET((unsigned long)varg->usr_buf));
+#endif
+}
+
+int virtaccel_req_timers(struct virtio_accel_req *req)
+{
+	struct scatterlist hdr_sg, hdrout_sg, hdrin_sg, status_sg, **sgs;
+	struct virtio_accel *vaccel = req->vaccel;
+	struct virtio_device *vdev = vaccel->vdev;
+	struct virtio_accel_hdr *h = &req->hdr;
+	struct accel_session *sess = req->priv;
+	int ret, out_nsgs = 0, in_nsgs = 0,
+		total_sgs = 2; // dyn sgs added later
+
+	ret = virtaccel_prepare_request(vdev, VIRTIO_ACCEL_GET_TIMERS, h, sess);
+	if (ret < 0)
+		return ret;
 	total_sgs += ret;
 
 	sgs = kzalloc_node(total_sgs * sizeof(*sgs), GFP_ATOMIC,
@@ -433,6 +577,79 @@ free_request:
 	return ret;
 }
 
+static int virtaccel_handle_timers(struct virtio_accel_req *req)
+{
+	struct virtio_accel *vaccel = req->vaccel;
+	struct virtio_device *vdev = vaccel->vdev;
+	struct virtio_accel_hdr *h = &req->hdr;
+	struct accel_session *sess = req->priv;
+	struct accel_prof_region *accel_timers;
+	struct accel_prof_sample **tmp_samples;
+	int ret = 0, *nt, *qnt, i, nr_timers;
+
+	struct virtio_accel_sess *vsess =
+		virtaccel_session_get_by_id(sess->id, req);
+
+	nt = (int *)virtaccel_get_prepared_buf(&h->op.in[0], vdev);
+	if (!nt) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (*nt == 0) {
+		*nt = vsess->nr_timers;
+	} else {
+		qnt = (int *)virtaccel_get_prepared_buf(&h->op.in[1], vdev);
+		if (!qnt) {
+			ret = -ENOMEM;
+			goto out_at;
+		}
+
+		nr_timers = (*nt) + (*qnt);
+		if (h->op.in_nr < 3 + nr_timers) {
+			ret = -EINVAL;
+			goto out_qnt;
+		}
+
+		accel_timers =
+			(struct accel_prof_region *)virtaccel_get_prepared_buf(&h->op.in[2], vdev);
+		if (h->op.in[2].len < nr_timers * sizeof(*accel_timers)) {
+			ret = -EINVAL;
+			goto out_qnt;
+		}
+		tmp_samples = kzalloc(nr_timers * sizeof(*tmp_samples), GFP_KERNEL);
+		if (!tmp_samples) {
+			ret =  -ENOMEM;
+			goto out_qnt;
+		}
+
+		for (i = 0; i < nr_timers; i++) {
+			tmp_samples[i] = accel_timers[i].samples;
+			accel_timers[i].samples =
+				(struct accel_prof_sample *)virtaccel_get_prepared_buf(&h->op.in[3 + i], vdev);
+		}
+
+		ret = virtaccel_timers_virtio_to_accel(accel_timers, nr_timers, vsess);
+		if (ret < 0)
+			goto out_qnt;
+
+		for (i = 0; i < nr_timers; i++) {
+			virtaccel_put_prepared_buf(&h->op.in[3 + i], (void *)accel_timers[i].samples);
+			accel_timers[i].samples = tmp_samples[i];
+		}
+
+out_qnt:
+		virtaccel_put_prepared_buf(&h->op.in[1], (void *)qnt);
+out_at:
+		virtaccel_put_prepared_buf(&h->op.in[2], (void *)accel_timers);
+		kfree(tmp_samples);
+	}
+	virtaccel_put_prepared_buf(&h->op.in[0], (void *)nt);
+
+out:
+	return ret;
+}
+
 void virtaccel_clear_req(struct virtio_accel_req *req)
 {
 	struct virtio_accel_hdr *h = &req->hdr;
@@ -440,8 +657,7 @@ void virtaccel_clear_req(struct virtio_accel_req *req)
 	switch (h->op_type) {
 	case VIRTIO_ACCEL_DO_OP:
 	case VIRTIO_ACCEL_CREATE_SESSION:
-		virtaccel_cleanup_args(h->op.out, h->op.out_nr);
-		virtaccel_cleanup_args(h->op.in, h->op.in_nr);
+	case VIRTIO_ACCEL_GET_TIMERS:
 		if (h->op.out_nr) {
 			if (h->op.in_nr)
 				sg_cleanup(req->sgs[3]);
@@ -450,8 +666,11 @@ void virtaccel_clear_req(struct virtio_accel_req *req)
 		}
 		if (h->op.in_nr)
 			sg_cleanup(req->sgs[req->out_sgs]);
+
 		kfree(req->sgs);
-		// fall through
+		virtaccel_cleanup_args(h->op.out, h->op.out_nr);
+		virtaccel_cleanup_args(h->op.in, h->op.in_nr);
+		fallthrough;
 	case VIRTIO_ACCEL_DESTROY_SESSION:
 		kfree((struct accel_session *)req->priv);
 		break;
@@ -463,28 +682,10 @@ void virtaccel_clear_req(struct virtio_accel_req *req)
 	req->in_sgs = 0;
 }
 
-static int virtaccel_write_user_output(struct virtio_accel_arg *varg, u32 nr_arg)
-{
-#ifndef ZC
-	int i = 0;
-
-	if (!nr_arg)
-		return 0;
-
-	for (i = 0; i < nr_arg; ++i) {
-		if (unlikely(copy_to_user(varg[i].usr_buf, varg[i].buf,
-					varg[i].len)))
-			return -EINVAL;
-	}
-#endif
-
-	return 0;
-}
-
 void virtaccel_handle_req_result(struct virtio_accel_req *req)
 {
 	struct virtio_accel_hdr *h = &req->hdr;
-	struct accel_session *sess;
+	struct accel_session *sess = req->priv;
 	int ret;
 
 	if (req->status != VIRTIO_ACCEL_OK)
@@ -492,13 +693,16 @@ void virtaccel_handle_req_result(struct virtio_accel_req *req)
 
 	switch (h->op_type) {
 	case VIRTIO_ACCEL_CREATE_SESSION:
-		sess = req->priv;
 		ret = virtaccel_write_user_output(h->op.in, h->op.in_nr);
 		if (ret) {
 			req->ret = -EINVAL;
 			return;
 		}
 
+		if (!virtaccel_session_create_and_add(sess, req)) {
+			req->ret = -ENOMEM;
+			return;
+		}
 		ret = copy_to_user(req->usr, sess, sizeof(*sess));
 		if (unlikely(ret)) {
 			req->ret = -EINVAL;
@@ -506,6 +710,7 @@ void virtaccel_handle_req_result(struct virtio_accel_req *req)
 		}
 		break;
 	case VIRTIO_ACCEL_DESTROY_SESSION:
+		virtaccel_session_delete(sess, req);
 		break;
 	case VIRTIO_ACCEL_DO_OP:
 		ret = virtaccel_write_user_output(h->op.in, h->op.in_nr);
@@ -513,7 +718,19 @@ void virtaccel_handle_req_result(struct virtio_accel_req *req)
 			req->ret = -EINVAL;
 			return;
 		}
+		break;
+	case VIRTIO_ACCEL_GET_TIMERS:
+		ret = virtaccel_handle_timers(req);
+		if (ret < 0) {
+			req->ret = ret;
+			return;
+		}
 
+		ret = virtaccel_write_user_output(h->op.in, h->op.in_nr);
+		if (ret) {
+			req->ret = -EINVAL;
+			return;
+		}
 		break;
 	default:
 		req->ret = -EBADMSG;
