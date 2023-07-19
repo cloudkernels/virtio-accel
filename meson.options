@@ -1,0 +1,29 @@
+option('kdir',
+  type : 'string',
+  description : 'Kernel source directory')
+
+option('debug_mode', 
+  type : 'integer',
+  min : 0,
+  max : 1,
+  value : 0,
+  description : 'Enable debug mode')
+
+option('zc',
+  type : 'integer',
+  min : 0,
+  max : 1,
+  value : 1,
+  description : 'Enable guest zero-copy')
+
+option('profiling',
+  type : 'integer',
+  min : 0,
+  max : 1,
+  value : 1,
+  description : 'Enable profiling')
+
+option('virtio-accel',
+  type : 'feature',
+  description : 'Build virtio-accel kernel module',
+  yield : true)
